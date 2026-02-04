@@ -6,8 +6,9 @@
 # - Wiring Test (no multimeter)
 # - Diagnostics Summary
 # - Y/N confirmations for dangerous actions
-#
-# Adapted from: https://github.com/bri3d/TC1791_CAN_BSL
+# - Dry-Run Mode (simulation)
+# - ECU State Detection
+# - Power-Stability Protection
 
 import math
 import struct
@@ -29,6 +30,9 @@ TWISTER_PATH = "../Simos18_SBOOT/twister"
 # Initial guess; can be refined by calibrate_crc_delay()
 CRC_DELAY = 0.0005
 SEED_START = "1D00000"
+
+# Dry-run global flag
+DRY_RUN = False
 
 sector_map_tc1791 = {
     0: 0x4000,
@@ -109,6 +113,24 @@ def get_key_from_seed(seed_data):
 
 
 def get_isotp_conn():
+    if DRY_RUN:
+        print("[DRY RUN] Would open IsoTP connection")
+        class DummyConn:
+            def send(self, *_args, **_kwargs):
+                print("[DRY RUN] Would send IsoTP frame")
+            def wait_frame(self, *_args, **_kwargs):
+                print("[DRY RUN] Would wait for IsoTP frame")
+                return bytes([0xA0] + [0x00] * 8)
+            def close(self):
+                print("[DRY RUN] Would close IsoTP connection")
+            @property
+            def tpsock(self):
+                class DummySock:
+                    def set_opts(self, **_kwargs):
+                        print("[DRY RUN] Would set IsoTP socket options")
+                return DummySock()
+        return DummyConn()
+
     conn = IsoTPSocketConnection(
         "can0", rxid=0x7E8, txid=0x7E0, params={"tx_padding": 0x55}
     )
@@ -118,6 +140,13 @@ def get_isotp_conn():
 
 
 def sboot_pwm(duty1=50.0, duty2=50.0, freq=3210):
+    if DRY_RUN:
+        print(f"[DRY RUN] Would start PWM on GPIO{PWM_PIN_1}/{PWM_PIN_2} "
+              f"freq={freq} duty1={duty1} duty2={duty2}")
+        class DummyPWM:
+            def stop(self): print("[DRY RUN] Would stop PWM")
+        return DummyPWM(), DummyPWM()
+
     pwm1 = GPIO.PWM(PWM_PIN_1, freq)
     pwm2 = GPIO.PWM(PWM_PIN_2, freq)
     pwm1.start(duty1)
@@ -126,16 +155,111 @@ def sboot_pwm(duty1=50.0, duty2=50.0, freq=3210):
 
 
 def reset_ecu():
+    if DRY_RUN:
+        print("[DRY RUN] Would reset ECU")
+        return
     lgpio.gpio_write(chip, RESET_PIN, 0)
     time.sleep(0.01)
     lgpio.gpio_write(chip, RESET_PIN, 1)
 
 
+def can_send(msg):
+    if DRY_RUN:
+        print(f"[DRY RUN] Would send CAN frame: ID=0x{msg.arbitration_id:X}, data={msg.data.hex()}")
+        return
+    bus.send(msg)
+
+
+def can_recv(timeout=None):
+    if DRY_RUN:
+        print("[DRY RUN] Would receive CAN frame")
+        return None
+    return bus.recv(timeout)
+
+
+# --- ECU State & Power Checks ---
+
+def detect_ecu_state():
+    if DRY_RUN:
+        print("[DRY RUN] Would detect ECU state")
+        return "NONE"
+
+    # Try normal mode: OBD request 0x7DF -> 01 00
+    try:
+        msg = Message(arbitration_id=0x7DF, data=[0x01, 0x00], is_extended_id=False)
+        bus.send(msg)
+        start = time.time()
+        while time.time() - start < 0.5:
+            m = bus.recv(0.1)
+            if m is None:
+                continue
+            if m.arbitration_id != 0x7DF:
+                return "NORMAL"
+    except Exception:
+        pass
+
+    # Try SBOOT: send 59 45 and see if we get A0 from 0x7E8
+    try:
+        msg = Message(arbitration_id=0x7E0, data=[0x59, 0x45], is_extended_id=False)
+        bus.send(msg)
+        start = time.time()
+        while time.time() - start < 0.5:
+            m = bus.recv(0.1)
+            if m is None:
+                continue
+            if m.arbitration_id == 0x7E8 and len(m.data) > 0 and m.data[0] == 0xA0:
+                return "SBOOT"
+    except Exception:
+        pass
+
+    # Try BSL: send 0x300 read device ID request
+    try:
+        msg = Message(
+            is_extended_id=False,
+            dlc=8,
+            arbitration_id=0x300,
+            data=[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        )
+        bus.send(msg)
+        start = time.time()
+        while time.time() - start < 0.5:
+            m = bus.recv(0.1)
+            if m is None:
+                continue
+            if m.arbitration_id == 0x300 and len(m.data) > 0 and m.data[0] == 0x01:
+                return "BSL"
+    except Exception:
+        pass
+
+    return "NONE"
+
+
+def ecu_power_stable(timeout=1.0):
+    if DRY_RUN:
+        print("[DRY RUN] Would check ECU power stability")
+        return True
+
+    start = time.time()
+    seen_any = False
+    try:
+        while time.time() - start < timeout:
+            m = bus.recv(0.1)
+            if m is not None:
+                seen_any = True
+                break
+    except Exception:
+        return False
+    return seen_any
+
+
+# --- SBOOT / BSL helpers ---
+
 def sboot_getseed():
     conn = get_isotp_conn()
     print("Sending 0x30 to elevate SBOOT shell status...")
     conn.send(bytes([0x30] + [0] * 12))
-    print_success_failure(conn.wait_frame())
+    data = conn.wait_frame()
+    print_success_failure(data)
     time.sleep(1)
     print("Sending 0x54 Generate Seed...")
     conn.send(bytes([0x54]))
@@ -158,6 +282,9 @@ def sboot_sendkey(key_data):
 
 def prepare_upload_bsl():
     print("Resetting ECU into HWCFG BSL Mode...")
+    if DRY_RUN:
+        print("[DRY RUN] Would pull BOOTCFG low for HWCFG BSL")
+        return
     lgpio.gpio_write(chip, BOOTCFG_PIN, 0)
 
 
@@ -166,10 +293,13 @@ def upload_bsl(skip_prep=False):
         prepare_upload_bsl()
     reset_ecu()
     time.sleep(0.1)
-    lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+    if not DRY_RUN:
+        lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+    else:
+        print("[DRY RUN] Would release BOOTCFG high")
 
     print("Sending BSL initialization message...")
-    bootloader_data = open("bootloader.bin", "rb").read()
+    bootloader_data = open("bootloader.bin", "rb").read() if not DRY_RUN else b"\x00" * 16
     data = [
         0x55,
         0x55,
@@ -181,13 +311,14 @@ def upload_bsl(skip_prep=False):
     init_message = Message(
         is_extended_id=False, dlc=8, arbitration_id=0x100, data=data
     )
-    success = False
-    bus.send(init_message)
-    while not success:
-        message = bus.recv(0.5)
-        if message is not None and not message.is_error_frame:
-            if message.arbitration_id == 0x40:
-                success = True
+    can_send(init_message)
+    if not DRY_RUN:
+        success = False
+        while not success:
+            message = can_recv(0.5)
+            if message is not None and not message.is_error_frame:
+                if message.arbitration_id == 0x40:
+                    success = True
     print("Sending BSL data...")
     for block_base_address in tqdm(
         range(0, len(bootloader_data), 8), unit_scale=True, unit="blocks"
@@ -199,11 +330,12 @@ def upload_bsl(skip_prep=False):
             arbitration_id=0xC0,
             data=bootloader_data[block_base_address:block_end],
         )
-        bus.send(message, timeout=5)
+        can_send(message)
         time.sleep(0.001)
     print("Device jumping into BSL... Draining receive queue...")
-    while bus.recv(0.01) is not None:
-        pass
+    if not DRY_RUN:
+        while can_recv(0.01) is not None:
+            pass
 
 
 def read_device_id():
@@ -213,13 +345,17 @@ def read_device_id():
         arbitration_id=0x300,
         data=[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
     )
-    bus.send(message)
+    can_send(message)
+    if DRY_RUN:
+        print("[DRY RUN] Would read device ID")
+        return b"\x00" * 8
+
     device_id = bytearray()
-    message = bus.recv()
-    if message.data[0] == 0x1:
+    message = can_recv()
+    if message and message.data[0] == 0x1:
         device_id += message.data[2:8]
-    message = bus.recv()
-    if message.data[0] == 0x1 and message.data[1] == 0x1:
+    message = can_recv()
+    if message and message.data[0] == 0x1 and message.data[1] == 0x1:
         device_id += message.data[2:8]
     return device_id
 
@@ -229,10 +365,14 @@ def read_byte(byte_specifier):
     data += byte_specifier
     data += bytearray([0x0, 0x0, 0x0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
+    can_send(message)
+    if DRY_RUN:
+        print(f"[DRY RUN] Would read byte at {byte_specifier.hex()}")
+        return b"\x00\x00\x00\x00"
+
     byte_data = bytearray()
-    message = bus.recv()
-    if message.data[0] == 0x2:
+    message = can_recv()
+    if message and message.data[0] == 0x2:
         byte_data += message.data[1:5]
     return byte_data
 
@@ -242,17 +382,21 @@ def write_byte(addr, value):
     data += addr
     data += bytearray([0x0, 0x0, 0x0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    message = bus.recv()
-    if message.data[0] != 0x3:
+    can_send(message)
+    if DRY_RUN:
+        print(f"[DRY RUN] Would write byte to {addr.hex()} value={value.hex()}")
+        return True
+
+    message = can_recv()
+    if not message or message.data[0] != 0x3:
         return False
     data = bytearray([0x03])
     data += value
     data += bytearray([0x0, 0x0, 0x0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    message = bus.recv()
-    return message.data[0] == 0x3
+    can_send(message)
+    message = can_recv()
+    return message and message.data[0] == 0x3
 
 
 def send_passwords(pw1, pw2, ucb=0, read_write=0x8):
@@ -260,26 +404,30 @@ def send_passwords(pw1, pw2, ucb=0, read_write=0x8):
     data += pw1
     data += bytearray([read_write, ucb, 0x0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    print(bus.recv())
+    can_send(message)
+    if not DRY_RUN:
+        print(can_recv())
     data = bytearray([0x04])
     data += pw2
     data += bytearray([0x0, 0x0, 0x0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    print(bus.recv())
+    can_send(message)
+    if not DRY_RUN:
+        print(can_recv())
     data = bytearray([0x04])
     data += pw1
     data += bytearray([read_write, ucb, 0x1])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    print(bus.recv())
+    can_send(message)
+    if not DRY_RUN:
+        print(can_recv())
     data = bytearray([0x04])
     data += pw2
     data += bytearray([0x0, 0x0, 0x0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    print(bus.recv())
+    can_send(message)
+    if not DRY_RUN:
+        print(can_recv())
 
 
 def erase_sector(address):
@@ -287,8 +435,11 @@ def erase_sector(address):
     data += address
     data += bytearray([0, 0, 0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    bus.recv()
+    if DRY_RUN:
+        print(f"[DRY RUN] Would erase sector at {address.hex()}")
+        return
+    can_send(message)
+    can_recv()
 
 
 def print_enabled_disabled(string, value):
@@ -409,16 +560,21 @@ def read_compressed(address, size, filename):
     data += address
     data += size
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
+    can_send(message)
+    if DRY_RUN:
+        print(f"[DRY RUN] Would read compressed data to {filename}")
+        output_file.close()
+        return
+
     total_size_remaining = int.from_bytes(size, "big")
     t = tqdm(total=total_size_remaining, unit="B")
     while total_size_remaining > 0:
-        message = bus.recv()
+        message = can_recv()
         compressed_size = size_remaining = int.from_bytes(message.data[5:8], "big")
         data = bytearray()
         sequence = 1
         while size_remaining > 0:
-            message = bus.recv()
+            message = can_recv()
             new_sequence = message.data[1]
             if sequence != new_sequence:
                 print("Sequencing error! " + hex(new_sequence) + hex(sequence))
@@ -435,7 +591,7 @@ def read_compressed(address, size, filename):
         output_file.write(decompressed_data)
         data = bytearray([0x07, 0xAC])
         message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-        bus.send(message)
+        can_send(message)
     output_file.close()
     t.close()
 
@@ -455,8 +611,11 @@ def write_file(address, size, filename):
             message = Message(
                 is_extended_id=False, dlc=8, arbitration_id=0x300, data=data
             )
-            bus.send(message)
-            bus.recv()
+            if DRY_RUN:
+                print(f"[DRY RUN] Would start write block at {address_bytes.hex()}")
+            else:
+                can_send(message)
+                can_recv()
         if block_counter < 7:
             data_len = block_counter
         else:
@@ -480,7 +639,10 @@ def write_file(address, size, filename):
         message = Message(
             is_extended_id=False, dlc=8, arbitration_id=0x300, data=data
         )
-        bus.send(message)
+        if DRY_RUN:
+            print(f"[DRY RUN] Would send write data: {file_data.hex()}")
+        else:
+            can_send(message)
         time.sleep(0.005)
         block_counter -= data_len
         total_size_remaining -= data_len
@@ -582,18 +744,18 @@ def sboot_shell(duty1=50.0, duty2=50.0):
     time.sleep(1)
     print("Resetting ECU into Supplier Bootloader...")
     reset_ecu()
-    bus.send(Message(data=[0x59, 0x45], arbitration_id=0x7E0, is_extended_id=False))
+    can_send(Message(data=[0x59, 0x45], arbitration_id=0x7E0, is_extended_id=False))
     print("Sending 59 45...")
-    bus.send(Message(data=[0x6B], arbitration_id=0x7E0, is_extended_id=False))
+    can_send(Message(data=[0x6B], arbitration_id=0x7E0, is_extended_id=False))
     stage2 = False
     try:
         while True:
             if stage2:
-                bus.send(
+                can_send(
                     Message(data=[0x6B], arbitration_id=0x7E0, is_extended_id=False)
                 )
                 print("Sending 6B...")
-            message = bus.recv(0.01)
+            message = can_recv(0.01)
             print(message)
             if (
                 message is not None
@@ -610,11 +772,21 @@ def sboot_shell(duty1=50.0, duty2=50.0):
                 print("FAILURE")
                 return False
     finally:
-        pwm1.stop()
-        pwm2.stop()
+        if pwm1:
+            pwm1.stop()
+        if pwm2:
+            pwm2.stop()
 
 
 def sboot_login(duty1=50.0, duty2=50.0):
+    if not ecu_power_stable():
+        print("ECU power unstable — aborting SBOOT login.")
+        return
+    state = detect_ecu_state()
+    if state not in ("NORMAL", "NONE"):  # NONE allowed if we are forcing entry
+        print(f"ECU state is {state}, not suitable for SBOOT login.")
+        return
+
     sboot_seed = sboot_shell(duty1=duty1, duty2=duty2)
     if not sboot_seed:
         print("SBOOT seed not received.")
@@ -690,11 +862,14 @@ def wiring_test():
 
     # RESET pin
     try:
-        lgpio.gpio_write(chip, RESET_PIN, 1)
-        time.sleep(0.01)
-        lgpio.gpio_write(chip, RESET_PIN, 0)
-        time.sleep(0.01)
-        lgpio.gpio_write(chip, RESET_PIN, 1)
+        if DRY_RUN:
+            print("[DRY RUN] Would toggle RESET pin")
+        else:
+            lgpio.gpio_write(chip, RESET_PIN, 1)
+            time.sleep(0.01)
+            lgpio.gpio_write(chip, RESET_PIN, 0)
+            time.sleep(0.01)
+            lgpio.gpio_write(chip, RESET_PIN, 1)
         print("RESET pin: OK")
     except Exception as e:
         print(f"RESET pin: FAILED ({e})")
@@ -702,11 +877,14 @@ def wiring_test():
 
     # BOOT_CFG pin
     try:
-        lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
-        time.sleep(0.01)
-        lgpio.gpio_write(chip, BOOTCFG_PIN, 0)
-        time.sleep(0.01)
-        lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+        if DRY_RUN:
+            print("[DRY RUN] Would toggle BOOT_CFG pin")
+        else:
+            lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+            time.sleep(0.01)
+            lgpio.gpio_write(chip, BOOTCFG_PIN, 0)
+            time.sleep(0.01)
+            lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
         print("BOOT_CFG pin: OK")
     except Exception as e:
         print(f"BOOT_CFG pin: FAILED ({e})")
@@ -735,23 +913,24 @@ def wiring_test():
     ecu_detected = False
     try:
         msg = Message(arbitration_id=0x7DF, data=[0x01, 0x00], is_extended_id=False)
-        bus.send(msg)
+        can_send(msg)
         print("CAN TX: OK")
     except Exception as e:
         print(f"CAN TX: FAILED ({e})")
         can_ok = False
 
     # Listen for any CAN traffic + specific response
-    try:
-        start = time.time()
-        while time.time() - start < 1.0:
-            m = bus.recv(0.1)
-            if m is None:
-                continue
-            ecu_detected = True
-            break
-    except Exception:
-        pass
+    if not DRY_RUN:
+        try:
+            start = time.time()
+            while time.time() - start < 1.0:
+                m = can_recv(0.1)
+                if m is None:
+                    continue
+                ecu_detected = True
+                break
+        except Exception:
+            pass
 
     if ecu_detected:
         print("ECU: DETECTED (CAN traffic seen)")
@@ -770,8 +949,11 @@ def diagnostics_summary():
     # GPIO quick check
     gpio_ok = True
     try:
-        lgpio.gpio_write(chip, RESET_PIN, 1)
-        lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+        if DRY_RUN:
+            print("[DRY RUN] Would set RESET/BOOTCFG high")
+        else:
+            lgpio.gpio_write(chip, RESET_PIN, 1)
+            lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
         print("GPIO: OK")
     except Exception as e:
         print(f"GPIO: FAILED ({e})")
@@ -799,39 +981,54 @@ def diagnostics_summary():
     ecu_detected = False
     try:
         msg = Message(arbitration_id=0x7DF, data=[0x01, 0x00], is_extended_id=False)
-        bus.send(msg)
+        can_send(msg)
         print("CAN TX: OK")
     except Exception as e:
         print(f"CAN: FAILED ({e})")
         can_ok = False
 
-    try:
-        start = time.time()
-        while time.time() - start < 1.0:
-            m = bus.recv(0.1)
-            if m is None:
-                continue
-            ecu_detected = True
-            break
-    except Exception:
-        pass
+    if not DRY_RUN:
+        try:
+            start = time.time()
+            while time.time() - start < 1.0:
+                m = can_recv(0.1)
+                if m is None:
+                    continue
+                ecu_detected = True
+                break
+        except Exception:
+            pass
 
     if ecu_detected:
         print("ECU: DETECTED")
     else:
         print("ECU: NOT DETECTED")
 
+    # ECU state + power
+    state = detect_ecu_state()
+    stable = ecu_power_stable()
+
+    print(f"ECU State: {state}")
+    print(f"Power Stability: {'OK' if stable else 'UNSTABLE'}")
+
     print("\nSummary:")
     print(f"  GPIO: {'OK' if gpio_ok else 'FAIL'}")
     print(f"  PWM:  {'OK' if pwm_ok else 'FAIL'}")
     print(f"  CAN:  {'OK' if can_ok else 'FAIL'}")
     print(f"  ECU:  {'DETECTED' if ecu_detected else 'NOT DETECTED'}")
+    print(f"  State: {state}")
+    print(f"  Power: {'OK' if stable else 'UNSTABLE'}")
 
 
 # --- CLI ---
 
 def main_menu():
+    global DRY_RUN
+
     print("\n=== TC1791 CAN BSL – Raspberry Pi 5 CLI ===\n")
+    if DRY_RUN:
+        print("=== DRY-RUN MODE ACTIVE — NO COMMANDS WILL TOUCH THE ECU ===\n")
+
     print("1) Enter SBOOT (login)")
     print("   - Runs PWM glitch, resets ECU, enters Supplier Bootloader.")
     print("2) Extract boot passwords")
@@ -848,12 +1045,14 @@ def main_menu():
     print("   - Tests GPIO, PWM, CAN TX, and ECU presence (safe).")
     print("8) Diagnostics Summary")
     print("   - Pre-flight check of GPIO, PWM, CAN, ECU status.")
-    print("9) Exit")
+    print(f"9) Toggle Dry-Run Mode (currently: {'ON' if DRY_RUN else 'OFF'})")
+    print("10) Exit")
     choice = input("Select an option: ").strip()
     return choice
 
 
 if __name__ == "__main__":
+    global DRY_RUN
     try:
         print("=== TC1791 CAN BSL – Raspberry Pi 5 version ===")
 
@@ -924,6 +1123,10 @@ if __name__ == "__main__":
                 diagnostics_summary()
 
             elif choice == "9":
+                DRY_RUN = not DRY_RUN
+                print(f"Dry-Run Mode is now {'ON' if DRY_RUN else 'OFF'}.")
+
+            elif choice == "10":
                 print("Exiting.")
                 break
 
