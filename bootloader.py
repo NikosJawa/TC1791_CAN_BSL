@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
-# Raspberry Pi 5–compatible TC1791 CAN BSL tool with
-# lgpio + RPi.GPIO, hardware PWM, and basic auto-calibration
-# Ported from https://github.com/bri3d/TC1791_CAN_BSL
+# TC1791 CAN BSL – Raspberry Pi 5 version
+# With:
+# - Hardware PWM (RPi.GPIO)
+# - CAN via python-can (socketcan)
+# - Wiring Test (no multimeter)
+# - Diagnostics Summary
+# - Y/N confirmations for dangerous actions
+#
+# Adapted from: https://github.com/bri3d/TC1791_CAN_BSL
 
-import cmd
-import crc_bruteforce
+import math
+import struct
+import subprocess
+import time
+
 import can
 from can import Message
+import crc_bruteforce
 import lz4.block
-import math
 from tqdm import tqdm
-import struct
-import time
-import subprocess
 from udsoncan.connections import IsoTPSocketConnection
-import socket
 
 import lgpio
 import RPi.GPIO as GPIO
 
 TWISTER_PATH = "../Simos18_SBOOT/twister"
 
-# Initial guess; will be refined by calibrate_crc_delay()
+# Initial guess; can be refined by calibrate_crc_delay()
 CRC_DELAY = 0.0005
 SEED_START = "1D00000"
 
@@ -43,6 +48,32 @@ sector_map_tc1791 = {
     14: 0x40000,
     15: 0x40000,
 }
+
+# --- GPIO / CAN setup ---
+
+can_interface = "can0"
+bus = can.interface.Bus(interface="socketcan", channel=can_interface)
+
+chip = lgpio.gpiochip_open(0)
+RESET_PIN = 23
+BOOTCFG_PIN = 24
+lgpio.gpio_claim_output(chip, RESET_PIN)
+lgpio.gpio_claim_output(chip, BOOTCFG_PIN)
+lgpio.gpio_write(chip, RESET_PIN, 1)
+lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+
+GPIO.setmode(GPIO.BCM)
+PWM_PIN_1 = 12
+PWM_PIN_2 = 13
+GPIO.setup(PWM_PIN_1, GPIO.OUT)
+GPIO.setup(PWM_PIN_2, GPIO.OUT)
+
+
+# --- Helpers ---
+
+def confirm(prompt="Continue? (y/n): "):
+    ans = input(prompt).strip().lower()
+    return ans == "y"
 
 
 def bits(byte):
@@ -77,28 +108,6 @@ def get_key_from_seed(seed_data):
     return output_data
 
 
-# --- CAN + GPIO / PWM init for Pi 5 ---
-
-can_interface = "can0"
-bus = can.interface.Bus(interface="socketcan", channel="can0")
-
-# lgpio for reset + BOOT_CFG
-chip = lgpio.gpiochip_open(0)
-RESET_PIN = 23
-BOOTCFG_PIN = 24
-lgpio.gpio_claim_output(chip, RESET_PIN)
-lgpio.gpio_claim_output(chip, BOOTCFG_PIN)
-lgpio.gpio_write(chip, RESET_PIN, 1)
-lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
-
-# RPi.GPIO for PWM on 12/13
-GPIO.setmode(GPIO.BCM)
-PWM_PIN_1 = 12
-PWM_PIN_2 = 13
-GPIO.setup(PWM_PIN_1, GPIO.OUT)
-GPIO.setup(PWM_PIN_2, GPIO.OUT)
-
-
 def get_isotp_conn():
     conn = IsoTPSocketConnection(
         "can0", rxid=0x7E8, txid=0x7E0, params={"tx_padding": 0x55}
@@ -109,7 +118,6 @@ def get_isotp_conn():
 
 
 def sboot_pwm(duty1=50.0, duty2=50.0, freq=3210):
-    """Start hardware PWM on GPIO 12 & 13 at given freq and duty."""
     pwm1 = GPIO.PWM(PWM_PIN_1, freq)
     pwm2 = GPIO.PWM(PWM_PIN_2, freq)
     pwm1.start(duty1)
@@ -149,17 +157,15 @@ def sboot_sendkey(key_data):
 
 
 def prepare_upload_bsl():
-    # Pin 24 -> BOOT_CFG pin, pulled to GND to enable BSL mode.
     print("Resetting ECU into HWCFG BSL Mode...")
     lgpio.gpio_write(chip, BOOTCFG_PIN, 0)
 
 
 def upload_bsl(skip_prep=False):
-    if skip_prep is False:
+    if not skip_prep:
         prepare_upload_bsl()
     reset_ecu()
     time.sleep(0.1)
-    # release BOOTCFG
     lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
 
     print("Sending BSL initialization message...")
@@ -177,7 +183,7 @@ def upload_bsl(skip_prep=False):
     )
     success = False
     bus.send(init_message)
-    while success is False:
+    while not success:
         message = bus.recv(0.5)
         if message is not None and not message.is_error_frame:
             if message.arbitration_id == 0x40:
@@ -246,10 +252,7 @@ def write_byte(addr, value):
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
     bus.send(message)
     message = bus.recv()
-    if message.data[0] != 0x3:
-        return False
-    else:
-        return True
+    return message.data[0] == 0x3
 
 
 def send_passwords(pw1, pw2, ucb=0, read_write=0x8):
@@ -258,29 +261,25 @@ def send_passwords(pw1, pw2, ucb=0, read_write=0x8):
     data += bytearray([read_write, ucb, 0x0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
     bus.send(message)
-    message = bus.recv()
-    print(message)
+    print(bus.recv())
     data = bytearray([0x04])
     data += pw2
     data += bytearray([0x0, 0x0, 0x0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
     bus.send(message)
-    message = bus.recv()
-    print(message)
+    print(bus.recv())
     data = bytearray([0x04])
     data += pw1
     data += bytearray([read_write, ucb, 0x1])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
     bus.send(message)
-    message = bus.recv()
-    print(message)
+    print(bus.recv())
     data = bytearray([0x04])
     data += pw2
     data += bytearray([0x0, 0x0, 0x0])
     message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
     bus.send(message)
-    message = bus.recv()
-    print(message)
+    print(bus.recv())
 
 
 def erase_sector(address):
@@ -319,7 +318,6 @@ def print_sector_status(string, procon_sector_status):
                 + " : "
                 + "ENABLED"
             )
-
         current_address += sector_map_tc1791[sector_number]
 
 
@@ -336,54 +334,56 @@ def read_flash_properties(flash_num, pmu_base_addr):
     procon2_value = read_byte(struct.pack(">I", pmu_base_addr + PROCON2))
     pmem_string = "PMEM" + str(flash_num)
     flash_status = bits(fsr_value[2])
-    print_enabled_disabled(pmem_string + " Protection Installation: ", flash_status[0])
+    print_enabled_disabled(pmem_string + " Protection Installation:", flash_status[0])
     print_enabled_disabled(
-        pmem_string + " Read Protection Installation: ", flash_status[2]
+        pmem_string + " Read Protection Installation:", flash_status[2]
     )
-    print_enabled_disabled(pmem_string + " Read Protection Inhibit: ", flash_status[3])
-    print_enabled_disabled(pmem_string + " Write Protection User 0: ", flash_status[5])
-    print_enabled_disabled(pmem_string + " Write Protection User 1: ", flash_status[6])
-    print_enabled_disabled(pmem_string + " OTP Installation: ", flash_status[7])
+    print_enabled_disabled(pmem_string + " Read Protection Inhibit:", flash_status[3])
+    print_enabled_disabled(pmem_string + " Write Protection User 0:", flash_status[5])
+    print_enabled_disabled(pmem_string + " Write Protection User 1:", flash_status[6])
+    print_enabled_disabled(pmem_string + " OTP Installation:", flash_status[7])
 
     flash_status_write = bits(fsr_value[3])
     print_enabled_disabled(
-        pmem_string + " Write Protection User 0 Inhibit: ", flash_status_write[1]
+        pmem_string + " Write Protection User 0 Inhibit:", flash_status_write[1]
     )
     print_enabled_disabled(
-        pmem_string + " Write Protection User 1 Inhibit: ", flash_status_write[2]
+        pmem_string + " Write Protection User 1 Inhibit:", flash_status_write[2]
     )
 
     flash_status_overall = bits(fsr_value[0])
-    print_enabled_disabled(pmem_string + " Page Mode Enabled: ", flash_status_overall[6])
+    print_enabled_disabled(
+        pmem_string + " Page Mode Enabled:", flash_status_overall[6]
+    )
 
     flash_status_errors = bits(fsr_value[1])
     print_enabled_disabled(
-        pmem_string + " Flash Operation Error: ", flash_status_errors[0]
+        pmem_string + " Flash Operation Error:", flash_status_errors[0]
     )
     print_enabled_disabled(
-        pmem_string + " Flash Command Sequence Error: ", flash_status_errors[2]
+        pmem_string + " Flash Command Sequence Error:", flash_status_errors[2]
     )
     print_enabled_disabled(
-        pmem_string + " Flash Locked Error: ", flash_status_errors[3]
+        pmem_string + " Flash Locked Error:", flash_status_errors[3]
     )
-    print_enabled_disabled(pmem_string + " Flash ECC Error: ", flash_status_errors[4])
+    print_enabled_disabled(pmem_string + " Flash ECC Error:", flash_status_errors[4])
 
     protection_status = bits(fcon_value[2])
-    print_enabled_disabled(pmem_string + " Read Protection: ", protection_status[0])
+    print_enabled_disabled(pmem_string + " Read Protection:", protection_status[0])
     print_enabled_disabled(
-        pmem_string + " Disable Code Fetch from Flash Memory: ", protection_status[1]
+        pmem_string + " Disable Code Fetch from Flash Memory:", protection_status[1]
     )
     print_enabled_disabled(
-        pmem_string + " Disable Any Data Fetch from Flash: ", protection_status[2]
+        pmem_string + " Disable Any Data Fetch from Flash:", protection_status[2]
     )
     print_enabled_disabled(
-        pmem_string + " Disable Data Fetch from DMA Controller: ", protection_status[4]
+        pmem_string + " Disable Data Fetch from DMA Controller:", protection_status[4]
     )
     print_enabled_disabled(
-        pmem_string + " Disable Data Fetch from PCP Controller: ", protection_status[5]
+        pmem_string + " Disable Data Fetch from PCP Controller:", protection_status[5]
     )
     print_enabled_disabled(
-        pmem_string + " Disable Data Fetch from SHE Controller: ", protection_status[6]
+        pmem_string + " Disable Data Fetch from SHE Controller:", protection_status[6]
     )
     procon0_sector_status = bits(procon0_value[0]) + bits(procon0_value[1])
     print_sector_status(pmem_string + " USR0 Read Protection ", procon0_sector_status)
@@ -433,7 +433,7 @@ def read_compressed(address, size, filename):
         t.update(decompressed_size)
         total_size_remaining -= decompressed_size
         output_file.write(decompressed_data)
-        data = bytearray([0x07, 0xAC])  # send an ACK packet
+        data = bytearray([0x07, 0xAC])
         message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
         bus.send(message)
     output_file.close()
@@ -586,36 +586,39 @@ def sboot_shell(duty1=50.0, duty2=50.0):
     print("Sending 59 45...")
     bus.send(Message(data=[0x6B], arbitration_id=0x7E0, is_extended_id=False))
     stage2 = False
-    while True:
-        if stage2 is True:
-            bus.send(
-                Message(data=[0x6B], arbitration_id=0x7E0, is_extended_id=False)
-            )
-            print("Sending 6B...")
-        message = bus.recv(0.01)
-        print(message)
-        if (
-            message is not None
-            and message.arbitration_id == 0x7E8
-            and message.data[0] == 0xA0
-        ):
-            print("Got A0 message")
+    try:
+        while True:
             if stage2:
-                print("Switching to IsoTP Socket...")
-                pwm1.stop()
-                pwm2.stop()
-                return sboot_getseed()
-            print("Sending 6B...")
-            stage2 = True
-        if message is not None and message.arbitration_id == 0x0A7:
-            print("FAILURE")
-            pwm1.stop()
-            pwm2.stop()
-            return False
+                bus.send(
+                    Message(data=[0x6B], arbitration_id=0x7E0, is_extended_id=False)
+                )
+                print("Sending 6B...")
+            message = bus.recv(0.01)
+            print(message)
+            if (
+                message is not None
+                and message.arbitration_id == 0x7E8
+                and message.data[0] == 0xA0
+            ):
+                print("Got A0 message")
+                if stage2:
+                    print("Switching to IsoTP Socket...")
+                    return sboot_getseed()
+                print("Sending 6B...")
+                stage2 = True
+            if message is not None and message.arbitration_id == 0x0A7:
+                print("FAILURE")
+                return False
+    finally:
+        pwm1.stop()
+        pwm2.stop()
 
 
 def sboot_login(duty1=50.0, duty2=50.0):
     sboot_seed = sboot_shell(duty1=duty1, duty2=duty2)
+    if not sboot_seed:
+        print("SBOOT seed not received.")
+        return
     print("Calculating key for seed: ")
     print(sboot_seed.hex())
     key = get_key_from_seed(sboot_seed.hex()[0:8])
@@ -636,19 +639,18 @@ def extract_boot_passwords():
         print(address.hex() + " - " + hex(end_address) + " -> " + hex(crc))
         crcs.append(hex(crc))
     boot_passwords = crc_bruteforce.calculate_passwords(crcs)
-    print(boot_passwords.hex())
+    print("Boot passwords:", boot_passwords.hex())
 
 
 # --- Auto-calibration helpers ---
 
-
 def calibrate_crc_delay(start=0.0003, stop=0.0012, step=0.0001):
-    """Sweep CRC_DELAY and pick the one where CRC address advances by 0x100."""
     global CRC_DELAY
     base_addr = bytearray.fromhex("8001420C")
     best = None
     print("Starting CRC_DELAY calibration sweep...")
-    for d in [start + i * step for i in range(int((stop - start) / step) + 1)]:
+    for i in range(int((stop - start) / step) + 1):
+        d = start + i * step
         CRC_DELAY = d
         print(f"Trying CRC_DELAY={d:.7f}")
         addr_before, _ = sboot_crc_reset(base_addr)
@@ -666,9 +668,9 @@ def calibrate_crc_delay(start=0.0003, stop=0.0012, step=0.0001):
 
 
 def calibrate_pwm_duty(duty_start=30.0, duty_stop=70.0, duty_step=5.0):
-    """Sweep PWM duty cycle until SBOOT handshake (A0) succeeds."""
     print("Starting PWM duty calibration sweep...")
-    for duty in [duty_start + i * duty_step for i in range(int((duty_stop - duty_start) / duty_step) + 1)]:
+    for i in range(int((duty_stop - duty_start) / duty_step) + 1):
+        duty = duty_start + i * duty_step
         print(f"Trying duty={duty}% on both channels...")
         seed = sboot_shell(duty1=duty, duty2=duty)
         if seed and isinstance(seed, (bytes, bytearray)) and len(seed) > 0:
@@ -678,70 +680,257 @@ def calibrate_pwm_duty(duty_start=30.0, duty_stop=70.0, duty_step=5.0):
     return 50.0
 
 
+# --- Wiring Test & Diagnostics ---
+
+def wiring_test():
+    print("\n=== Wiring Test ===")
+
+    # GPIO tests
+    gpio_ok = True
+
+    # RESET pin
+    try:
+        lgpio.gpio_write(chip, RESET_PIN, 1)
+        time.sleep(0.01)
+        lgpio.gpio_write(chip, RESET_PIN, 0)
+        time.sleep(0.01)
+        lgpio.gpio_write(chip, RESET_PIN, 1)
+        print("RESET pin: OK")
+    except Exception as e:
+        print(f"RESET pin: FAILED ({e})")
+        gpio_ok = False
+
+    # BOOT_CFG pin
+    try:
+        lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+        time.sleep(0.01)
+        lgpio.gpio_write(chip, BOOTCFG_PIN, 0)
+        time.sleep(0.01)
+        lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+        print("BOOT_CFG pin: OK")
+    except Exception as e:
+        print(f"BOOT_CFG pin: FAILED ({e})")
+        gpio_ok = False
+
+    # PWM tests
+    pwm_ok = True
+    pwm1 = None
+    pwm2 = None
+    try:
+        pwm1, pwm2 = sboot_pwm(duty1=50.0, duty2=50.0, freq=3210)
+        time.sleep(0.2)
+        print("PWM12: ACTIVE")
+        print("PWM13: ACTIVE")
+    except Exception as e:
+        print(f"PWM: FAILED ({e})")
+        pwm_ok = False
+    finally:
+        if pwm1:
+            pwm1.stop()
+        if pwm2:
+            pwm2.stop()
+
+    # CAN TX + ECU detection
+    can_ok = True
+    ecu_detected = False
+    try:
+        msg = Message(arbitration_id=0x7DF, data=[0x01, 0x00], is_extended_id=False)
+        bus.send(msg)
+        print("CAN TX: OK")
+    except Exception as e:
+        print(f"CAN TX: FAILED ({e})")
+        can_ok = False
+
+    # Listen for any CAN traffic + specific response
+    try:
+        start = time.time()
+        while time.time() - start < 1.0:
+            m = bus.recv(0.1)
+            if m is None:
+                continue
+            ecu_detected = True
+            break
+    except Exception:
+        pass
+
+    if ecu_detected:
+        print("ECU: DETECTED (CAN traffic seen)")
+    else:
+        print("ECU: NOT DETECTED (no CAN traffic)")
+
+    if gpio_ok and pwm_ok and can_ok:
+        print("\nWiring test PASSED")
+    else:
+        print("\nWiring test FAILED (see above details)")
+
+
+def diagnostics_summary():
+    print("\n=== Diagnostics Summary ===")
+
+    # GPIO quick check
+    gpio_ok = True
+    try:
+        lgpio.gpio_write(chip, RESET_PIN, 1)
+        lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+        print("GPIO: OK")
+    except Exception as e:
+        print(f"GPIO: FAILED ({e})")
+        gpio_ok = False
+
+    # PWM quick check
+    pwm_ok = True
+    pwm1 = None
+    pwm2 = None
+    try:
+        pwm1, pwm2 = sboot_pwm(duty1=50.0, duty2=50.0, freq=3210)
+        time.sleep(0.1)
+        print("PWM: OK")
+    except Exception as e:
+        print(f"PWM: FAILED ({e})")
+        pwm_ok = False
+    finally:
+        if pwm1:
+            pwm1.stop()
+        if pwm2:
+            pwm2.stop()
+
+    # CAN quick check
+    can_ok = True
+    ecu_detected = False
+    try:
+        msg = Message(arbitration_id=0x7DF, data=[0x01, 0x00], is_extended_id=False)
+        bus.send(msg)
+        print("CAN TX: OK")
+    except Exception as e:
+        print(f"CAN: FAILED ({e})")
+        can_ok = False
+
+    try:
+        start = time.time()
+        while time.time() - start < 1.0:
+            m = bus.recv(0.1)
+            if m is None:
+                continue
+            ecu_detected = True
+            break
+    except Exception:
+        pass
+
+    if ecu_detected:
+        print("ECU: DETECTED")
+    else:
+        print("ECU: NOT DETECTED")
+
+    print("\nSummary:")
+    print(f"  GPIO: {'OK' if gpio_ok else 'FAIL'}")
+    print(f"  PWM:  {'OK' if pwm_ok else 'FAIL'}")
+    print(f"  CAN:  {'OK' if can_ok else 'FAIL'}")
+    print(f"  ECU:  {'DETECTED' if ecu_detected else 'NOT DETECTED'}")
+
+
+# --- CLI ---
+
 def main_menu():
-    print("\n=== TC1791 CAN BSL – Raspberry Pi 5 CLI ===")
+    print("\n=== TC1791 CAN BSL – Raspberry Pi 5 CLI ===\n")
     print("1) Enter SBOOT (login)")
+    print("   - Runs PWM glitch, resets ECU, enters Supplier Bootloader.")
     print("2) Extract boot passwords")
+    print("   - Performs SBOOT login + CRC brute-force to recover passwords.")
     print("3) Upload BSL")
+    print("   - Sends bootloader.bin to ECU RAM and triggers BSL mode.")
     print("4) Read device ID")
+    print("   - Reads ECU identification bytes (safe).")
     print("5) Calibrate PWM duty cycle")
+    print("   - Sweeps PWM duty cycles to find stable SBOOT entry.")
     print("6) Calibrate CRC_DELAY")
-    print("7) Exit")
+    print("   - Tunes timing for CRC brute-force (requires ECU connected).")
+    print("7) Wiring Test")
+    print("   - Tests GPIO, PWM, CAN TX, and ECU presence (safe).")
+    print("8) Diagnostics Summary")
+    print("   - Pre-flight check of GPIO, PWM, CAN, ECU status.")
+    print("9) Exit")
     choice = input("Select an option: ").strip()
     return choice
-    
+
 
 if __name__ == "__main__":
     try:
         print("=== TC1791 CAN BSL – Raspberry Pi 5 version ===")
-        # Optional: run calibration once before serious work
-        # duty = calibrate_pwm_duty()
-        # calibrate_crc_delay()
-        # Then use sboot_login(duty1=duty, duty2=duty) etc.
-                while True:
+
+        while True:
             choice = main_menu()
 
             if choice == "1":
                 print("Running SBOOT login...")
-                sboot_login()
+                if confirm(
+                    "This will reset the ECU and start PWM glitching. Continue? (y/n): "
+                ):
+                    sboot_login()
+                else:
+                    print("Cancelled.")
 
             elif choice == "2":
                 print("Extracting boot passwords...")
-                extract_boot_passwords()
+                if confirm(
+                    "This will perform SBOOT login and CRC brute-force. Continue? (y/n): "
+                ):
+                    extract_boot_passwords()
+                else:
+                    print("Cancelled.")
 
             elif choice == "3":
                 print("Uploading BSL...")
-                upload_bsl()
+                if confirm(
+                    "This will upload a bootloader to ECU RAM and trigger BSL mode. Continue? (y/n): "
+                ):
+                    upload_bsl()
+                else:
+                    print("Cancelled.")
 
             elif choice == "4":
                 print("Reading device ID...")
-                dev = read_device_id()
-                print("Device ID:", dev.hex())
+                if confirm("Read ECU device ID now? (y/n): "):
+                    dev = read_device_id()
+                    print("Device ID:", dev.hex())
+                else:
+                    print("Cancelled.")
 
             elif choice == "5":
                 print("Calibrating PWM duty cycle...")
-                duty = calibrate_pwm_duty()
-                print(f"Best duty cycle found: {duty}%")
+                if confirm(
+                    "This will repeatedly reset ECU and run PWM glitching. Continue? (y/n): "
+                ):
+                    duty = calibrate_pwm_duty()
+                    print(f"Best duty cycle found: {duty}%")
+                else:
+                    print("Cancelled.")
 
             elif choice == "6":
                 print("Calibrating CRC_DELAY...")
-                calibrate_crc_delay()
-                print(f"Final CRC_DELAY = {CRC_DELAY}")
+                if confirm(
+                    "This will repeatedly reset ECU and run CRC validation. Continue? (y/n): "
+                ):
+                    calibrate_crc_delay()
+                    print(f"Final CRC_DELAY = {CRC_DELAY}")
+                else:
+                    print("Cancelled.")
 
             elif choice == "7":
+                print("Running wiring test (safe)...")
+                wiring_test()
+
+            elif choice == "8":
+                print("Running diagnostics summary (safe)...")
+                diagnostics_summary()
+
+            elif choice == "9":
                 print("Exiting.")
                 break
 
             else:
                 print("Invalid choice. Try again.")
-        
+
     finally:
-        # Clean up GPIO on exit
         GPIO.cleanup()
         lgpio.gpiochip_close(chip)
-
-
-
-
-
-
+        print("GPIO cleaned up.")
