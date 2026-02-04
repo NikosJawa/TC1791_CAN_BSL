@@ -80,7 +80,7 @@ def get_key_from_seed(seed_data):
 # --- CAN + GPIO / PWM init for Pi 5 ---
 
 can_interface = "can0"
-bus = can.interface.Bus(can_interface, bustype="socketcan")
+bus = can.interface.Bus(interface="socketcan", channel="can0")
 
 # lgpio for reset + BOOT_CFG
 chip = lgpio.gpiochip_open(0)
@@ -678,6 +678,19 @@ def calibrate_pwm_duty(duty_start=30.0, duty_stop=70.0, duty_step=5.0):
     return 50.0
 
 
+def main_menu():
+    print("\n=== TC1791 CAN BSL – Raspberry Pi 5 CLI ===")
+    print("1) Enter SBOOT (login)")
+    print("2) Extract boot passwords")
+    print("3) Upload BSL")
+    print("4) Read device ID")
+    print("5) Calibrate PWM duty cycle")
+    print("6) Calibrate CRC_DELAY")
+    print("7) Exit")
+    choice = input("Select an option: ").strip()
+    return choice
+    
+
 if __name__ == "__main__":
     try:
         print("=== TC1791 CAN BSL – Raspberry Pi 5 version ===")
@@ -685,8 +698,50 @@ if __name__ == "__main__":
         # duty = calibrate_pwm_duty()
         # calibrate_crc_delay()
         # Then use sboot_login(duty1=duty, duty2=duty) etc.
-        print("Module loaded. Call functions from an interactive shell or add your own CLI.")
+                while True:
+            choice = main_menu()
+
+            if choice == "1":
+                print("Running SBOOT login...")
+                sboot_login()
+
+            elif choice == "2":
+                print("Extracting boot passwords...")
+                extract_boot_passwords()
+
+            elif choice == "3":
+                print("Uploading BSL...")
+                upload_bsl()
+
+            elif choice == "4":
+                print("Reading device ID...")
+                dev = read_device_id()
+                print("Device ID:", dev.hex())
+
+            elif choice == "5":
+                print("Calibrating PWM duty cycle...")
+                duty = calibrate_pwm_duty()
+                print(f"Best duty cycle found: {duty}%")
+
+            elif choice == "6":
+                print("Calibrating CRC_DELAY...")
+                calibrate_crc_delay()
+                print(f"Final CRC_DELAY = {CRC_DELAY}")
+
+            elif choice == "7":
+                print("Exiting.")
+                break
+
+            else:
+                print("Invalid choice. Try again.")
+        
     finally:
         # Clean up GPIO on exit
         GPIO.cleanup()
         lgpio.gpiochip_close(chip)
+
+
+
+
+
+
