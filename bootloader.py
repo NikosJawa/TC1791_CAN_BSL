@@ -199,12 +199,20 @@ def get_isotp_conn():
                 return DummySock()
         return DummyConn()
 
+    # udsoncan 1.25.1 constructor:
+    # IsoTPSocketConnection(interface, address, rxid, txid, params)
     conn = IsoTPSocketConnection(
-        "can0", rxid=0x7E8, txid=0x7E0, params={"tx_padding": 0x55}
+        "can0",
+        address=0x7E0,          # ECU request ID
+        rxid=0x7E8,             # ECU response ID
+        txid=0x7E0,             # Same as address
+        params={"tx_padding": 0x55}
     )
+
     conn.tpsock.set_opts(txpad=0x55)
     conn.open()
     return conn
+
 
 
 def sboot_pwm(duty1=50.0, duty2=50.0, freq=3210):
