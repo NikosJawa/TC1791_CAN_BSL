@@ -180,6 +180,9 @@ def get_key_from_seed(seed_data):
     return output_data
 
 
+from udsoncan.connections import IsoTPSocketConnection
+from isotp import Address
+
 def get_isotp_conn():
     if DRY_RUN:
         info("[DRY RUN] Would open IsoTP connection")
@@ -199,19 +202,18 @@ def get_isotp_conn():
                 return DummySock()
         return DummyConn()
 
-    # udsoncan 1.25.1 constructor:
-    # IsoTPSocketConnection(interface, address, rxid, txid, params)
-    conn = IsoTPSocketConnection(
-        "can0",
-        address=0x7E0,          # ECU request ID
-        rxid=0x7E8,             # ECU response ID
-        txid=0x7E0,             # Same as address
-        params={"tx_padding": 0x55}
+    # Create proper isotp.Address object
+    addr = Address(
+        rxid=0x7E8,
+        txid=0x7E0,
+        tx_padding=0x55
     )
 
+    conn = IsoTPSocketConnection("can0", address=addr)
     conn.tpsock.set_opts(txpad=0x55)
     conn.open()
     return conn
+
 
 
 
