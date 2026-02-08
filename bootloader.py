@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-# Raspberry Pi 5–compatible TC1791 CAN BSL tool with
-# lgpio + RPi.GPIO, hardware PWM, and basic auto-calibration
-# Ported from https://github.com/bri3d/TC1791_CAN_BSL
-
 import cmd
 import crc_bruteforce
 import can
@@ -16,16 +11,25 @@ import subprocess
 from udsoncan.connections import IsoTPSocketConnection
 import socket
 
-import lgpio
 import RPi.GPIO as GPIO
+import lgpio
 
-TWISTER_PATH = "../Simos18_SBOOT/twister"
+TWISTER_PATH = (
+    "../Simos18_SBOOT/twister"
+)  # This is the path to the "twister" binary from https://github.com/bri3d/Simos18_SBOOT
 
-# Initial guess; will be refined by calibrate_crc_delay()
-CRC_DELAY = 0.0005
-SEED_START = "1D00000"
+# Configurable parameters:
 
-sector_map_tc1791 = {
+# For a Pi 3B+, 0.0005 seems right. For a Pi 4, 0.0008 has been observed to work correctly (presumably latency between sleep and GPIO is lower).
+CRC_DELAY = (
+    0.0005
+)  # This is the amount of time a single iteration of the CRC process takes. This will need to be adjusted through observation, checking the output of the boot password read process until 0x100 bytes are being checked.
+
+SEED_START = (
+    "1D00000"
+)  # This is the starting value for the expected timer value range for the Seed/Key calculation. This seems to work for both Pi 3B+ and Pi 4.
+
+sector_map_tc1791 = {  # Sector lengths for PMEM routines
     0: 0x4000,
     1: 0x4000,
     2: 0x4000,
@@ -61,7 +65,7 @@ def bits(byte):
 
 
 def print_success_failure(data):
-    if data[0] == 0xA0:
+    if data[0] is 0xA0:
         print("Success")
     else:
         print("Failure! " + data.hex())
@@ -77,26 +81,18 @@ def get_key_from_seed(seed_data):
     return output_data
 
 
-# --- CAN + GPIO / PWM init for Pi 5 ---
-
 can_interface = "can0"
-bus = can.interface.Bus(interface="socketcan", channel=can_interface)
+bus = can.interface.Bus(can_interface, bustype="socketcan")
 
-# lgpio for reset + BOOT_CFG
-chip = lgpio.gpiochip_open(0)
-RESET_PIN = 23
-BOOTCFG_PIN = 24
-lgpio.gpio_claim_output(chip, RESET_PIN)
-lgpio.gpio_claim_output(chip, BOOTCFG_PIN)
-lgpio.gpio_write(chip, RESET_PIN, 1)
-lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
+# --- GPIO / PWM setup (RPi.GPIO + lgpio) ---
 
-# RPi.GPIO for PWM on 12/13
 GPIO.setmode(GPIO.BCM)
-PWM_PIN_1 = 12
-PWM_PIN_2 = 13
-GPIO.setup(PWM_PIN_1, GPIO.OUT)
-GPIO.setup(PWM_PIN_2, GPIO.OUT)
+GPIO.setup(23, GPIO.OUT, pull_up_down=GPIO.PUD_UP)
+
+CHIP = 0
+PWM_PIN_12 = 12
+PWM_PIN_13 = 13
+lgpio_handle = lgpio.gpiochip_open(CHIP)
 
 
 def get_isotp_conn():
@@ -108,25 +104,32 @@ def get_isotp_conn():
     return conn
 
 
-def sboot_pwm(duty1=50.0, duty2=50.0, freq=3210):
-    """Start hardware PWM on GPIO 12 & 13 at given freq and duty."""
-    pwm1 = GPIO.PWM(PWM_PIN_1, freq)
-    pwm2 = GPIO.PWM(PWM_PIN_2, freq)
-    pwm1.start(duty1)
-    pwm2.start(duty2)
-    return pwm1, pwm2
+def sboot_pwm():
+    # Approximate the original pigpio wavePWM behavior using lgpio PWM
+    freq = 3210
+    # Duty cycles as percentages (0–100)
+    lgpio.tx_pwm(lgpio_handle, PWM_PIN_13, freq, 50.0)  # 50% duty
+    time.sleep(0.0001)
+    lgpio.tx_pwm(lgpio_handle, PWM_PIN_12, freq, 25.0)  # 25% duty
+
+    class PWMWrap:
+        def cancel(self_inner):
+            lgpio.tx_pwm(lgpio_handle, PWM_PIN_13, 0, 0.0)
+            lgpio.tx_pwm(lgpio_handle, PWM_PIN_12, 0, 0.0)
+
+    return PWMWrap()
 
 
 def reset_ecu():
-    lgpio.gpio_write(chip, RESET_PIN, 0)
+    GPIO.output(23, GPIO.LOW)
     time.sleep(0.01)
-    lgpio.gpio_write(chip, RESET_PIN, 1)
+    GPIO.output(23, GPIO.HIGH)
 
 
 def sboot_getseed():
     conn = get_isotp_conn()
     print("Sending 0x30 to elevate SBOOT shell status...")
-    conn.send(bytes([0x30] + [0] * 12))
+    conn.send(bytes([0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
     print_success_failure(conn.wait_frame())
     time.sleep(1)
     print("Sending 0x54 Generate Seed...")
@@ -148,349 +151,7 @@ def sboot_sendkey(key_data):
     conn.close()
 
 
-def prepare_upload_bsl():
-    # Pin 24 -> BOOT_CFG pin, pulled to GND to enable BSL mode.
-    print("Resetting ECU into HWCFG BSL Mode...")
-    lgpio.gpio_write(chip, BOOTCFG_PIN, 0)
-
-
-def upload_bsl(skip_prep=False):
-    if skip_prep is False:
-        prepare_upload_bsl()
-    reset_ecu()
-    time.sleep(0.1)
-    # release BOOTCFG
-    lgpio.gpio_write(chip, BOOTCFG_PIN, 1)
-
-    print("Sending BSL initialization message...")
-    bootloader_data = open("bootloader.bin", "rb").read()
-    data = [
-        0x55,
-        0x55,
-        0x00,
-        0x01,
-    ]
-    data += struct.pack("<H", math.ceil(len(bootloader_data) / 8))
-    data += [0x0, 0x3]
-    init_message = Message(
-        is_extended_id=False, dlc=8, arbitration_id=0x100, data=data
-    )
-    success = False
-    bus.send(init_message)
-    while success is False:
-        message = bus.recv(0.5)
-        if message is not None and not message.is_error_frame:
-            if message.arbitration_id == 0x40:
-                success = True
-    print("Sending BSL data...")
-    for block_base_address in tqdm(
-        range(0, len(bootloader_data), 8), unit_scale=True, unit="blocks"
-    ):
-        block_end = min(len(bootloader_data), block_base_address + 8)
-        message = Message(
-            is_extended_id=False,
-            dlc=8,
-            arbitration_id=0xC0,
-            data=bootloader_data[block_base_address:block_end],
-        )
-        bus.send(message, timeout=5)
-        time.sleep(0.001)
-    print("Device jumping into BSL... Draining receive queue...")
-    while bus.recv(0.01) is not None:
-        pass
-
-
-def read_device_id():
-    message = Message(
-        is_extended_id=False,
-        dlc=8,
-        arbitration_id=0x300,
-        data=[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-    )
-    bus.send(message)
-    device_id = bytearray()
-    message = bus.recv()
-    if message.data[0] == 0x1:
-        device_id += message.data[2:8]
-    message = bus.recv()
-    if message.data[0] == 0x1 and message.data[1] == 0x1:
-        device_id += message.data[2:8]
-    return device_id
-
-
-def read_byte(byte_specifier):
-    data = bytearray([0x02])
-    data += byte_specifier
-    data += bytearray([0x0, 0x0, 0x0])
-    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    byte_data = bytearray()
-    message = bus.recv()
-    if message.data[0] == 0x2:
-        byte_data += message.data[1:5]
-    return byte_data
-
-
-def write_byte(addr, value):
-    data = bytearray([0x03])
-    data += addr
-    data += bytearray([0x0, 0x0, 0x0])
-    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    message = bus.recv()
-    if message.data[0] != 0x3:
-        return False
-    data = bytearray([0x03])
-    data += value
-    data += bytearray([0x0, 0x0, 0x0])
-    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    message = bus.recv()
-    if message.data[0] != 0x3:
-        return False
-    else:
-        return True
-
-
-def send_passwords(pw1, pw2, ucb=0, read_write=0x8):
-    data = bytearray([0x04])
-    data += pw1
-    data += bytearray([read_write, ucb, 0x0])
-    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    message = bus.recv()
-    print(message)
-    data = bytearray([0x04])
-    data += pw2
-    data += bytearray([0x0, 0x0, 0x0])
-    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    message = bus.recv()
-    print(message)
-    data = bytearray([0x04])
-    data += pw1
-    data += bytearray([read_write, ucb, 0x1])
-    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    message = bus.recv()
-    print(message)
-    data = bytearray([0x04])
-    data += pw2
-    data += bytearray([0x0, 0x0, 0x0])
-    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    message = bus.recv()
-    print(message)
-
-
-def erase_sector(address):
-    data = bytearray([0x05])
-    data += address
-    data += bytearray([0, 0, 0])
-    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    bus.recv()
-
-
-def print_enabled_disabled(string, value):
-    enabled_or_disabled = "ENABLED" if value > 0 else "DISABLED"
-    print(string + " " + enabled_or_disabled)
-
-
-def print_sector_status(string, procon_sector_status):
-    current_address = 0
-    for sector_number in sector_map_tc1791:
-        protection_status = procon_sector_status[sector_number]
-        if sector_number > 9:
-            protection_status = procon_sector_status[
-                math.ceil(
-                    sector_number - (sector_number % 2) - (sector_number - 10) / 2
-                )
-            ]
-        if protection_status > 0:
-            print(
-                string
-                + "Sector "
-                + str(sector_number)
-                + " "
-                + hex(current_address)
-                + ":"
-                + hex((current_address + sector_map_tc1791[sector_number]))
-                + " : "
-                + "ENABLED"
-            )
-
-        current_address += sector_map_tc1791[sector_number]
-
-
-def read_flash_properties(flash_num, pmu_base_addr):
-    FSR = 0x1010
-    FCON = 0x1014
-    PROCON0 = 0x1020
-    PROCON1 = 0x1024
-    PROCON2 = 0x1028
-    fsr_value = read_byte(struct.pack(">I", pmu_base_addr + FSR))
-    fcon_value = read_byte(struct.pack(">I", pmu_base_addr + FCON))
-    procon0_value = read_byte(struct.pack(">I", pmu_base_addr + PROCON0))
-    procon1_value = read_byte(struct.pack(">I", pmu_base_addr + PROCON1))
-    procon2_value = read_byte(struct.pack(">I", pmu_base_addr + PROCON2))
-    pmem_string = "PMEM" + str(flash_num)
-    flash_status = bits(fsr_value[2])
-    print_enabled_disabled(pmem_string + " Protection Installation: ", flash_status[0])
-    print_enabled_disabled(
-        pmem_string + " Read Protection Installation: ", flash_status[2]
-    )
-    print_enabled_disabled(pmem_string + " Read Protection Inhibit: ", flash_status[3])
-    print_enabled_disabled(pmem_string + " Write Protection User 0: ", flash_status[5])
-    print_enabled_disabled(pmem_string + " Write Protection User 1: ", flash_status[6])
-    print_enabled_disabled(pmem_string + " OTP Installation: ", flash_status[7])
-
-    flash_status_write = bits(fsr_value[3])
-    print_enabled_disabled(
-        pmem_string + " Write Protection User 0 Inhibit: ", flash_status_write[1]
-    )
-    print_enabled_disabled(
-        pmem_string + " Write Protection User 1 Inhibit: ", flash_status_write[2]
-    )
-
-    flash_status_overall = bits(fsr_value[0])
-    print_enabled_disabled(pmem_string + " Page Mode Enabled: ", flash_status_overall[6])
-
-    flash_status_errors = bits(fsr_value[1])
-    print_enabled_disabled(
-        pmem_string + " Flash Operation Error: ", flash_status_errors[0]
-    )
-    print_enabled_disabled(
-        pmem_string + " Flash Command Sequence Error: ", flash_status_errors[2]
-    )
-    print_enabled_disabled(
-        pmem_string + " Flash Locked Error: ", flash_status_errors[3]
-    )
-    print_enabled_disabled(pmem_string + " Flash ECC Error: ", flash_status_errors[4])
-
-    protection_status = bits(fcon_value[2])
-    print_enabled_disabled(pmem_string + " Read Protection: ", protection_status[0])
-    print_enabled_disabled(
-        pmem_string + " Disable Code Fetch from Flash Memory: ", protection_status[1]
-    )
-    print_enabled_disabled(
-        pmem_string + " Disable Any Data Fetch from Flash: ", protection_status[2]
-    )
-    print_enabled_disabled(
-        pmem_string + " Disable Data Fetch from DMA Controller: ", protection_status[4]
-    )
-    print_enabled_disabled(
-        pmem_string + " Disable Data Fetch from PCP Controller: ", protection_status[5]
-    )
-    print_enabled_disabled(
-        pmem_string + " Disable Data Fetch from SHE Controller: ", protection_status[6]
-    )
-    procon0_sector_status = bits(procon0_value[0]) + bits(procon0_value[1])
-    print_sector_status(pmem_string + " USR0 Read Protection ", procon0_sector_status)
-    procon1_sector_status = bits(procon1_value[0]) + bits(procon1_value[1])
-    print_sector_status(pmem_string + " USR1 Write Protection ", procon1_sector_status)
-    procon2_sector_status = bits(procon2_value[0]) + bits(procon2_value[1])
-    print_sector_status(pmem_string + " USR2 OTP Protection ", procon2_sector_status)
-
-
-def read_bytes_file(base_addr, size, filename):
-    output_file = open(filename, "wb")
-    for current_address in tqdm(
-        range(base_addr, base_addr + size, 4), unit_scale=True, unit="block"
-    ):
-        b = read_byte(struct.pack(">I", current_address))
-        output_file.write(b)
-    output_file.close()
-
-
-def read_compressed(address, size, filename):
-    output_file = open(filename, "wb")
-    data = bytearray([0x07])
-    data += address
-    data += size
-    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-    bus.send(message)
-    total_size_remaining = int.from_bytes(size, "big")
-    t = tqdm(total=total_size_remaining, unit="B")
-    while total_size_remaining > 0:
-        message = bus.recv()
-        compressed_size = size_remaining = int.from_bytes(message.data[5:8], "big")
-        data = bytearray()
-        sequence = 1
-        while size_remaining > 0:
-            message = bus.recv()
-            new_sequence = message.data[1]
-            if sequence != new_sequence:
-                print("Sequencing error! " + hex(new_sequence) + hex(sequence))
-                t.close()
-                output_file.close()
-                return
-            sequence = (sequence + 1) & 0xFF
-            data += message.data[2:8]
-            size_remaining -= 6
-        decompressed_data = lz4.block.decompress(data[:compressed_size], 4096)
-        decompressed_size = len(decompressed_data)
-        t.update(decompressed_size)
-        total_size_remaining -= decompressed_size
-        output_file.write(decompressed_data)
-        data = bytearray([0x07, 0xAC])  # send an ACK packet
-        message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
-        bus.send(message)
-    output_file.close()
-    t.close()
-
-
-def write_file(address, size, filename):
-    input_file = open(filename, "rb")
-    total_size_remaining = int.from_bytes(size, "big")
-    t = tqdm(total=total_size_remaining, unit="B")
-    address_int = int.from_bytes(address, "big")
-    block_counter = 0
-    while total_size_remaining > 0:
-        if block_counter <= 0:
-            block_counter = 256
-            data = bytearray([0x06])
-            address_bytes = address_int.to_bytes(4, "big")
-            data += address_bytes
-            message = Message(
-                is_extended_id=False, dlc=8, arbitration_id=0x300, data=data
-            )
-            bus.send(message)
-            bus.recv()
-        if block_counter < 7:
-            data_len = block_counter
-        else:
-            data_len = 7
-        file_data = input_file.read(data_len)
-        if len(file_data) == 0:
-            break
-        file_data += bytearray([0xAA] * (7 - len(file_data)))
-        data = bytearray([0x06])
-        data += bytearray(
-            [
-                file_data[0],
-                file_data[1],
-                file_data[2],
-                file_data[3],
-                file_data[4],
-                file_data[5],
-                file_data[6],
-            ]
-        )
-        message = Message(
-            is_extended_id=False, dlc=8, arbitration_id=0x300, data=data
-        )
-        bus.send(message)
-        time.sleep(0.005)
-        block_counter -= data_len
-        total_size_remaining -= data_len
-        t.update(data_len)
-    input_file.close()
-    t.close()
-
-
 def sboot_crc_reset(crc_start_address):
-    global CRC_DELAY
     prepare_upload_bsl()
     conn = get_isotp_conn()
     print("Setting initial CRC to 0x0...")
@@ -562,23 +223,19 @@ def sboot_crc_reset(crc_start_address):
     conn.send(bytes([0x79]))
     time.sleep(CRC_DELAY)
     upload_bsl(True)
-    crc_address = int.from_bytes(
-        read_byte(0xD0010770.to_bytes(4, "big")), "little"
-    )
+    crc_address = int.from_bytes(read_byte(0xD0010770 .to_bytes(4, "big")), "little")
     print("CRC Address Reached: ")
     print(hex(crc_address))
-    crc_data = int.from_bytes(
-        read_byte(0xD0010778.to_bytes(4, "big")), "little"
-    )
+    crc_data = int.from_bytes(read_byte(0xD0010778 .to_bytes(4, "big")), "little")
     print("CRC32 Current Value: ")
     print(hex(crc_data))
     conn.close()
     return (crc_address, crc_data)
 
 
-def sboot_shell(duty1=50.0, duty2=50.0):
+def sboot_shell():
     print("Setting up PWM waveforms...")
-    pwm1, pwm2 = sboot_pwm(duty1=duty1, duty2=duty2)
+    pwm = sboot_pwm()
     time.sleep(1)
     print("Resetting ECU into Supplier Bootloader...")
     reset_ecu()
@@ -588,9 +245,7 @@ def sboot_shell(duty1=50.0, duty2=50.0):
     stage2 = False
     while True:
         if stage2 is True:
-            bus.send(
-                Message(data=[0x6B], arbitration_id=0x7E0, is_extended_id=False)
-            )
+            bus.send(Message(data=[0x6B], arbitration_id=0x7E0, is_extended_id=False))
             print("Sending 6B...")
         message = bus.recv(0.01)
         print(message)
@@ -602,20 +257,18 @@ def sboot_shell(duty1=50.0, duty2=50.0):
             print("Got A0 message")
             if stage2:
                 print("Switching to IsoTP Socket...")
-                pwm1.stop()
-                pwm2.stop()
+                pwm.cancel()
                 return sboot_getseed()
             print("Sending 6B...")
             stage2 = True
         if message is not None and message.arbitration_id == 0x0A7:
             print("FAILURE")
-            pwm1.stop()
-            pwm2.stop()
+            pwm.cancel()
             return False
 
 
-def sboot_login(duty1=50.0, duty2=50.0):
-    sboot_seed = sboot_shell(duty1=duty1, duty2=duty2)
+def sboot_login():
+    sboot_seed = sboot_shell()
     print("Calculating key for seed: ")
     print(sboot_seed.hex())
     key = get_key_from_seed(sboot_seed.hex()[0:8])
@@ -626,8 +279,7 @@ def sboot_login(duty1=50.0, duty2=50.0):
 
 def extract_boot_passwords():
     addresses = map(
-        lambda x: bytearray.fromhex(x),
-        ["8001420C", "80014210", "80014214", "80014218"],
+        lambda x: bytearray.fromhex(x), ["8001420C", "80014210", "80014214", "80014218"]
     )
     crcs = []
     for address in addresses:
@@ -639,54 +291,455 @@ def extract_boot_passwords():
     print(boot_passwords.hex())
 
 
-# --- Auto-calibration helpers ---
+# Enter REPL
 
 
-def calibrate_crc_delay(start=0.0003, stop=0.0012, step=0.0001):
-    """Sweep CRC_DELAY and pick the one where CRC address advances by 0x100."""
-    global CRC_DELAY
-    base_addr = bytearray.fromhex("8001420C")
-    best = None
-    print("Starting CRC_DELAY calibration sweep...")
-    for d in [start + i * step for i in range(int((stop - start) / step) + 1)]:
-        CRC_DELAY = d
-        print(f"Trying CRC_DELAY={d:.7f}")
-        addr_before, _ = sboot_crc_reset(base_addr)
-        addr_after, _ = sboot_crc_reset(base_addr)
-        delta = addr_after - addr_before
-        print(f"Delta address: 0x{delta:X}")
-        if delta == 0x100:
-            best = d
-            print(f"Found ideal CRC_DELAY={d:.7f}")
-            break
-    if best is not None:
-        CRC_DELAY = best
+def prepare_upload_bsl():
+    # Pin 24 -> BOOT_CFG pin, pulled to GND to enable BSL mode.
+    print("Resetting ECU into HWCFG BSL Mode...")
+    GPIO.setup(24, GPIO.OUT, pull_up_down=GPIO.PUD_DOWN)
+    GPIO.output(24, GPIO.LOW)
+
+
+def upload_bsl(skip_prep=False):
+    if skip_prep == False:
+        prepare_upload_bsl()
+    reset_ecu()
+    time.sleep(0.1)
+    GPIO.setup(24, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
+
+    print("Sending BSL initialization message...")
+    # send bootloader.bin to CAN BSL in Tricore
+    bootloader_data = open("bootloader.bin", "rb").read()
+    data = [
+        0x55,
+        0x55,
+        0x00,
+        0x01,
+    ]  # 0x55 0x55 bit sync, 0x100 CAN ID for ACK (copied directly to MOAR register, so lower 2 bits are discarded, this will yield actual 0x40 CAN ID)
+    data += struct.pack("<H", math.ceil(len(bootloader_data) / 8))
+    data += [0x0, 0x3]  # 0x300 CAN ID for Data -> 0xC0 after right shift
+    init_message = Message(
+        is_extended_id=False, dlc=8, arbitration_id=0x100, data=data
+    )  # 0x55 0x55 = magic for init, 0x00 0x1 = 0x100 CAN ID, 0x1 0x0 = 1 packet data, 0x00, 0x3 = 0x300 transfer data can id
+    success = False
+    bus.send(init_message)
+    while success == False:
+        message = bus.recv(0.5)
+        if message is not None and not message.is_error_frame:
+            if message.arbitration_id == 0x40:
+                success = True
+    print("Sending BSL data...")
+    for block_base_address in tqdm(
+        range(0, len(bootloader_data), 8), unit_scale=True, unit="blocks"
+    ):
+        block_end = min(len(bootloader_data), block_base_address + 8)
+        message = Message(
+            is_extended_id=False,
+            dlc=8,
+            arbitration_id=0xC0,
+            data=bootloader_data[block_base_address:block_end],
+        )
+        bus.send(message, timeout=5)
+        time.sleep(0.001)
+    print("Device jumping into BSL... Draining receive queue...")
+    while bus.recv(0.01) is not None:
+        pass
+
+
+def read_device_id():
+    message = Message(
+        is_extended_id=False,
+        dlc=8,
+        arbitration_id=0x300,
+        data=[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    )
+    bus.send(message)
+    device_id = bytearray()
+    message = bus.recv()
+    if message.data[0] == 0x1:
+        device_id += message.data[2:8]
+    message = bus.recv()
+    if message.data[0] == 0x1 and message.data[1] == 0x1:
+        device_id += message.data[2:8]
+    return device_id
+
+
+def read_byte(byte_specifier):
+    data = bytearray([0x02])
+    data += byte_specifier
+    data += bytearray([0x0, 0x0, 0x0])
+    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+    bus.send(message)
+    byte_data = bytearray()
+    message = bus.recv()
+    if message.data[0] == 0x2:
+        byte_data += message.data[1:5]
+    return byte_data
+
+
+def write_byte(addr, value):
+    data = bytearray([0x03])
+    data += addr
+    data += bytearray([0x0, 0x0, 0x0])
+    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+    bus.send(message)
+    byte_data = bytearray()
+    message = bus.recv()
+    if message.data[0] != 0x3:
+        return False
+    data = bytearray([0x03])
+    data += value
+    data += bytearray([0x0, 0x0, 0x0])
+    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+    bus.send(message)
+    message = bus.recv()
+    if message.data[0] != 0x3:
+        return False
     else:
-        print("No perfect CRC_DELAY found in sweep; keeping last value.")
+        return True
 
 
-def calibrate_pwm_duty(duty_start=30.0, duty_stop=70.0, duty_step=5.0):
-    """Sweep PWM duty cycle until SBOOT handshake (A0) succeeds."""
-    print("Starting PWM duty calibration sweep...")
-    for duty in [duty_start + i * duty_step for i in range(int((duty_stop - duty_start) / duty_step) + 1)]:
-        print(f"Trying duty={duty}% on both channels...")
-        seed = sboot_shell(duty1=duty, duty2=duty)
-        if seed and isinstance(seed, (bytes, bytearray)) and len(seed) > 0:
-            print(f"PWM duty {duty}% works for SBOOT.")
-            return duty
-    print("No working duty found in sweep; defaulting to 50%.")
-    return 50.0
+def send_passwords(pw1, pw2, ucb=0, read_write=0x8):
+    data = bytearray([0x04])
+    data += pw1
+    data += bytearray([read_write, ucb, 0x0])
+    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+    bus.send(message)
+    byte_data = bytearray()
+    message = bus.recv()
+    print(message)
+    data = bytearray([0x04])
+    data += pw2
+    data += bytearray([0x0, 0x0, 0x0])
+    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+    bus.send(message)
+    message = bus.recv()
+    print(message)
+    data = bytearray([0x04])
+    data += pw1
+    data += bytearray([read_write, ucb, 0x1])
+    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+    bus.send(message)
+    byte_data = bytearray()
+    message = bus.recv()
+    print(message)
+    data = bytearray([0x04])
+    data += pw2
+    data += bytearray([0x0, 0x0, 0x0])
+    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+    bus.send(message)
+    message = bus.recv()
+    print(message)
 
 
-if __name__ == "__main__":
-    try:
-        print("=== TC1791 CAN BSL – Raspberry Pi 5 version ===")
-        # Optional: run calibration once before serious work
-        # duty = calibrate_pwm_duty()
-        # calibrate_crc_delay()
-        # Then use sboot_login(duty1=duty, duty2=duty) etc.
-        print("Module loaded. Call functions from an interactive shell or add your own CLI.")
-    finally:
-        # Clean up GPIO on exit
+def erase_sector(address):
+    data = bytearray([0x05])
+    data += address
+    data += bytearray([0, 0, 0])
+    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+    bus.send(message)
+    message = bus.recv()
+
+
+def print_enabled_disabled(string, value):
+    enabled_or_disabled = "ENABLED" if value > 0 else "DISABLED"
+    print(string + " " + enabled_or_disabled)
+
+
+def print_sector_status(string, procon_sector_status):
+    current_address = 0
+    for sector_number in sector_map_tc1791:
+        protection_status = procon_sector_status[sector_number]
+        if sector_number > 9:
+            protection_status = procon_sector_status[
+                math.ceil(
+                    sector_number - (sector_number % 2) - (sector_number - 10) / 2
+                )
+            ]
+        if protection_status > 0:
+            print(
+                string
+                + "Sector "
+                + str(sector_number)
+                + " "
+                + hex(current_address)
+                + ":"
+                + hex((current_address + sector_map_tc1791[sector_number]))
+                + " : "
+                + "ENABLED"
+            )
+
+        current_address += sector_map_tc1791[sector_number]
+
+
+def read_flash_properties(flash_num, pmu_base_addr):
+    FSR = 0x1010
+    FCON = 0x1014
+    PROCON0 = 0x1020
+    PROCON1 = 0x1024
+    PROCON2 = 0x1028
+    fsr_value = read_byte(struct.pack(">I", pmu_base_addr + FSR))
+    fcon_value = read_byte(struct.pack(">I", pmu_base_addr + FCON))
+    procon0_value = read_byte(struct.pack(">I", pmu_base_addr + PROCON0))
+    procon1_value = read_byte(struct.pack(">I", pmu_base_addr + PROCON1))
+    procon2_value = read_byte(struct.pack(">I", pmu_base_addr + PROCON2))
+    pmem_string = "PMEM" + str(flash_num)
+    flash_status = bits(fsr_value[2])
+    print_enabled_disabled(pmem_string + " Protection Installation: ", flash_status[0])
+    print_enabled_disabled(
+        pmem_string + " Read Protection Installation: ", flash_status[2]
+    )
+    print_enabled_disabled(pmem_string + " Read Protection Inhibit: ", flash_status[3])
+    print_enabled_disabled(pmem_string + " Write Protection User 0: ", flash_status[5])
+    print_enabled_disabled(pmem_string + " Write Protection User 1: ", flash_status[6])
+    print_enabled_disabled(pmem_string + " OTP Installation: ", flash_status[7])
+
+    flash_status_write = bits(fsr_value[3])
+    print_enabled_disabled(
+        pmem_string + " Write Protection User 0 Inhibit: ", flash_status_write[1]
+    )
+    print_enabled_disabled(
+        pmem_string + " Write Protection User 1 Inhibit: ", flash_status_write[2]
+    )
+
+    flash_status_overall = bits(fsr_value[0])
+    print_enabled_disabled(pmem_string + " Page Mode Enabled: ", flash_status_overall[6])
+
+    flash_status_errors = bits(fsr_value[1])
+    print_enabled_disabled(pmem_string + " Flash Operation Error: ", flash_status_errors[0])
+    print_enabled_disabled(pmem_string + " Flash Command Sequence Error: ", flash_status_errors[2])
+    print_enabled_disabled(pmem_string + " Flash Locked Error: ", flash_status_errors[3])
+    print_enabled_disabled(pmem_string + " Flash ECC Error: ", flash_status_errors[4])
+
+    protection_status = bits(fcon_value[2])
+    print_enabled_disabled(pmem_string + " Read Protection: ", protection_status[0])
+    print_enabled_disabled(
+        pmem_string + " Disable Code Fetch from Flash Memory: ", protection_status[1]
+    )
+    print_enabled_disabled(
+        pmem_string + " Disable Any Data Fetch from Flash: ", protection_status[2]
+    )
+    print_enabled_disabled(
+        pmem_string + " Disable Data Fetch from DMA Controller: ", protection_status[4]
+    )
+    print_enabled_disabled(
+        pmem_string + " Disable Data Fetch from PCP Controller: ", protection_status[5]
+    )
+    print_enabled_disabled(
+        pmem_string + " Disable Data Fetch from SHE Controller: ", protection_status[6]
+    )
+    procon0_sector_status = bits(procon0_value[0]) + bits(procon0_value[1])
+    print_sector_status(pmem_string + " USR0 Read Protection ", procon0_sector_status)
+    procon1_sector_status = bits(procon1_value[0]) + bits(procon1_value[1])
+    print_sector_status(pmem_string + " USR1 Write Protection ", procon1_sector_status)
+    procon2_sector_status = bits(procon2_value[0]) + bits(procon2_value[1])
+    print_sector_status(pmem_string + " USR2 OTP Protection ", procon2_sector_status)
+
+
+def read_bytes_file(base_addr, size, filename):
+    output_file = open(filename, "wb")
+    for current_address in tqdm(
+        range(base_addr, base_addr + size, 4), unit_scale=True, unit="block"
+    ):
+        bytes = read_byte(struct.pack(">I", current_address))
+        output_file.write(bytes)
+    output_file.close()
+
+
+def read_compressed(address, size, filename):
+    output_file = open(filename, "wb")
+    data = bytearray([0x07])
+    data += address
+    data += size
+    message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+    bus.send(message)
+    total_size_remaining = int.from_bytes(size, "big")
+    t = tqdm(total=total_size_remaining, unit="B")
+    while total_size_remaining > 0:
+        message = bus.recv()
+        compressed_size = size_remaining = int.from_bytes(message.data[5:8], "big")
+        #print("Waiting for compressed data of size: " + hex(size_remaining))
+        data = bytearray()
+        sequence = 1
+        while size_remaining > 0:
+            message = bus.recv()
+            new_sequence = message.data[1]
+            if sequence != new_sequence:
+                print("Sequencing error! " + hex(new_sequence) + hex(sequence))
+                t.close()
+                output_file.close()
+                return
+            sequence += 1
+            sequence = sequence & 0xFF
+            data += message.data[2:8]
+            size_remaining -= 6
+        decompressed_data = lz4.block.decompress(data[:compressed_size], 4096)
+        decompressed_size = len(decompressed_data)
+        t.update(decompressed_size)
+        total_size_remaining -= decompressed_size
+        output_file.write(decompressed_data)
+        data = bytearray([0x07, 0xAC])  # send an ACk packet
+        message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+        bus.send(message)
+    output_file.close()
+    t.close()
+
+def write_file(address, size, filename):
+    input_file = open(filename, "rb")
+    total_size_remaining = int.from_bytes(size, "big")
+    t = tqdm(total=total_size_remaining, unit="B")
+    address_int = int.from_bytes(address, "big")
+    block_counter = 0
+    while total_size_remaining > 0:
+        if block_counter <= 0:
+          block_counter = 256
+          data = bytearray([0x06])
+          address_bytes = address_int.to_bytes(4, "big")
+          data += address_bytes
+          message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+          bus.send(message)
+          bus.recv()
+        if block_counter < 7:
+          data_len = block_counter
+        else:
+          data_len = 7
+        file_data = input_file.read(data_len)
+        file_data += bytearray([0xAA] * (7 - data_len))
+        data = bytearray([0x06])
+        data += bytearray([file_data[0], file_data[1], file_data[2], file_data[3], file_data[4], file_data[5], file_data[6]])
+        message = Message(is_extended_id=False, dlc=8, arbitration_id=0x300, data=data)
+        bus.send(message)
+        time.sleep(0.005)
+        block_counter -= data_len
+        total_size_remaining -= data_len
+        if block_counter <= 0:
+          bus.recv()
+          t.update(total_size_remaining)
+          address_int += 256
+    input_file.close()
+    t.close()
+
+
+class BootloaderRepl(cmd.Cmd):
+    intro = "Welcome to Tricore BSL. Type help or ? to list commands, you are likely looking for upload to start.\n"
+    prompt = "(BSL) "
+    file = None
+
+    def do_upload(self, arg):
+        "upload: Upload BSL to device"
+        upload_bsl()
+
+    def do_deviceid(self, arg):
+        "deviceid: Read the Tricore Device ID from 0xD0000000 to 0xD000000C"
+        device_id = read_device_id()
+        if len(device_id) > 1:
+            print(device_id.hex())
+        else:
+            print("Failed to retrieve Device ID")
+
+    def do_readaddr(self, arg):
+        "readaddr <addr> : Read 32 bits from an arbitrary address"
+        byte_specifier = bytearray.fromhex(arg)
+        byte = read_byte(byte_specifier)
+        print(byte.hex())
+
+    def do_writeaddr(self, arg):
+        "writeaddr <addr> <data> : Write 32 bits to an arbitrary address"
+        args = arg.split()
+        byte_specifier = bytearray.fromhex(args[0])
+        data_specifier = bytearray.fromhex(args[1])
+        is_success = write_byte(byte_specifier, data_specifier)
+        if is_success:
+            print("Wrote " + args[1] + " to " + args[0])
+        else:
+            print("Failed to write value.")
+
+    def do_flashinfo(self, arg):
+        "flashinfo: Read flash information including PMEM protection status"
+        PMU_BASE_ADDRS = {0: 0xF8001000, 1: 0xF8003000}
+
+        for pmu_num in PMU_BASE_ADDRS:
+            read_flash_properties(pmu_num, PMU_BASE_ADDRS[pmu_num])
+
+    def do_dumpmaskrom(self, arg):
+        "dumpmaskrom: Dump the Tricore Mask ROM to maskrom.bin"
+        read_bytes_file(0xAFFFC000, 0x4000, "maskrom.bin")
+
+    def do_dumpmem(self, arg):
+        "dumpmem <addr> <size> <filename>: Dump <addr> to <filename> with <size> bytes"
+        args = arg.split()
+        read_bytes_file(int(args[0], 16), int(args[1], 16), args[2])
+
+    def do_sboot(self, arg):
+        "sboot: Reset into SBOOT Command Shell, execute Seed/Key process"
+        sboot_login()
+
+    def do_sboot_sendkey(self, arg):
+        "sboot_sendkey <keydata>: Send Key Data to SBOOT Command Shell"
+        args = arg.split()
+        key_data = bytearray.fromhex(args[0])
+        sboot_sendkey(key_data)
+
+    def do_sboot_crc_reset(self, arg):
+        "sboot_crc_reset <address>: Configure SBOOT with CRC header pointed to <address>, reboot"
+        args = arg.split()
+        password_address = bytearray.fromhex(args[0])
+        sboot_crc_reset(password_address)
+
+    def do_send_read_passwords(self, arg):
+        "send_read_passwords <pw1> <pw2>: unlock Flash using passwords"
+        args = arg.split()
+        pw1 = int.from_bytes(bytearray.fromhex(args[0]), "big").to_bytes(4, "little")
+        pw2 = int.from_bytes(bytearray.fromhex(args[1]), "big").to_bytes(4, "little")
+        send_passwords(pw1, pw2)
+
+    def do_send_write_passwords(self, arg):
+        "send_write_passwords <pw1> <pw2>: unlock Flash using passwords"
+        args = arg.split()
+        pw1 = int.from_bytes(bytearray.fromhex(args[0]), "big").to_bytes(4, "little")
+        pw2 = int.from_bytes(bytearray.fromhex(args[1]), "big").to_bytes(4, "little")
+        send_passwords(pw1, pw2, read_write=0x05, ucb=1)
+
+    def do_erase_sector(self, arg):
+        "erase_sector <addr> : Erase sector beginning with address"
+        byte_specifier = bytearray.fromhex(arg)
+        erase_sector(byte_specifier)
+
+    def do_extract_boot_passwords(self, arg):
+        "extract_boot_passwords : Extract Simos18 boot passwords using SBoot exploit chain. Requires 'crchack' in ../crchack and 'twister' in ../Simos18_SBOOT"
+        extract_boot_passwords()
+
+    def do_compressed_read(self, arg):
+        "compressed_read <addr> <length> <filename>: read data using LZ4 compression (fast, hopefully)"
+        args = arg.split()
+        byte_specifier = bytearray.fromhex(args[0])
+        length_specifier = bytearray.fromhex(args[1])
+        filename = args[2]
+        is_success = read_compressed(byte_specifier, length_specifier, filename)
+
+    def do_write_file(self, arg):
+        "write_file <addr> <length> <filename>: write data"
+        args = arg.split()
+        byte_specifier = bytearray.fromhex(args[0])
+        length_specifier = bytearray.fromhex(args[1])
+        filename = args[2]
+        is_success = write_file(byte_specifier, length_specifier, filename)
+
+    def do_reset(self, arg):
+        "reset: reset ECU"
+        reset_ecu()
+
+    def do_bye(self, arg):
+        "Exit"
         GPIO.cleanup()
-        lgpio.gpiochip_close(chip)
+        lgpio.gpiochip_close(lgpio_handle)
+        return True
+
+
+def parse(arg):
+    "Convert a series of zero or more numbers to an argument tuple"
+    return tuple(map(int, arg.split()))
+
+
+BootloaderRepl().cmdloop()
